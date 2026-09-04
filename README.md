@@ -1,6 +1,6 @@
 # nmrac
 
-A headless CLI for connecting to [Netmaker](https://netmaker.io) remote-access networks — what Netmaker Desktop does, without a GUI.
+A headless CLI for connecting to [Netmaker](https://netmaker.io) remote-access networks — what Netmaker Desktop does, without a GUI. Runs on **Linux and macOS**.
 
 Netmaker Desktop (the Remote Access Client) is a graphical app. On a server, a container, or anything over SSH there is nothing to click. `nmrac` drives the same server API from a shell: SSO login in your browser, pick a network, and it renders a WireGuard config and brings the tunnel up with `wg-quick`.
 
@@ -38,11 +38,23 @@ Remote access is a different thing entirely. A remote-access client is an **exte
 
 ## Requirements
 
-- `bash`, `curl`, `jq`
-- `wireguard-tools` (`wg`, `wg-quick`) and a kernel with WireGuard
-- `node` >= 22, for the browser SSO login — it uses Node's built-in `WebSocket`, no npm packages. Not needed if you use `nmrac login --paste`.
+- `bash` (3.2 is fine, so stock macOS `bash` works), `curl`, `jq`
+- `wireguard-tools` — `wg` and `wg-quick`
+- `node` >= 22, for the browser SSO login — it uses Node's built-in `WebSocket`, no npm packages. Not needed with `nmrac login --paste`.
 - root, for `/etc/wireguard` and `wg-quick`
 - A Netmaker **Pro** server with OAuth/SSO configured, and a user attached to at least one remote-access gateway
+
+On Debian/Ubuntu:
+
+```sh
+sudo apt install curl jq wireguard-tools
+```
+
+On macOS:
+
+```sh
+brew install jq wireguard-tools node
+```
 
 Tested against Netmaker server **v1.5.1**. See [Server compatibility](#server-compatibility).
 
@@ -73,7 +85,7 @@ sudo nmrac disconnect
 | `nmrac login [--paste]` | SSO login via browser. `--paste` falls back to pasting a JWT by hand. |
 | `nmrac logout` | Forget the stored token. Leaves tunnels running. |
 | `nmrac list` | Networks, their gateways, and whether each tunnel is up. |
-| `nmrac connect [--dns] [network]` | Bring a tunnel up. Prompts if no network is given. |
+| `nmrac connect [--dns\|--no-dns] [network]` | Bring a tunnel up. Prompts if no network is given. |
 | `nmrac disconnect [network]` | Take a tunnel down, or all of them. |
 | `nmrac status` | WireGuard peer state for active tunnels. |
 | `nmrac conf <network>` | Print the config the server hands out, without applying it. |
@@ -131,9 +143,22 @@ Both arrive at the same `/api/oauth/register/{regKey}` URL, but a 64-character s
 
 - **Tokens expire.** When one does, any command says so; run `nmrac login` again. Existing tunnels keep working — WireGuard does not care about the API.
 - **No boot persistence.** The tunnel does not come back after a reboot. `wg-quick@nm-*.service` will bring up an existing config, but the token may have expired by then, so a truly durable setup needs a re-login.
-- **DNS is opt-in.** The server always emits a `DNS =` line, and `wg-quick` needs `resolvconf` to apply it — which many minimal images lack. Without `--dns` the line is stripped, so the tunnel comes up and your existing resolver is left alone. With `--dns`, install `openresolv` first.
-- **Interface names.** Linux caps them at 15 characters and Netmaker network names are often longer, so interfaces are `nm-<first 12 chars>`, falling back to `nm-<hash>` if two networks collide. `/etc/nmrac/ifaces` keeps the mapping, and `list`/`status` show real network names.
+- **DNS is decided per platform.** The server always emits a `DNS =` line. macOS `wg-quick` applies it natively via `scutil`, so it is kept. Linux `wg-quick` shells out to `resolvconf`, which many minimal images lack, so the line is kept only when `resolvconf` is installed and stripped otherwise — the tunnel comes up either way and your existing resolver is left alone. Force it with `--dns` or `--no-dns`.
+- **Interface names.** Linux caps them at 15 characters and Netmaker network names are often longer, so configs are named `nm-<first 12 chars>`, falling back to `nm-<hash>` if two networks collide. `/etc/nmrac/ifaces` keeps the mapping, and `list`/`status` show real network names. On macOS the kernel assigns `utunN` regardless, so `status` shows both (`nm-lab-networ -> utun4`).
 - **Split vs full tunnel** is the gateway's decision, not this tool's. `nmrac` installs exactly the `AllowedIPs` the server sends.
+
+## Platform support
+
+| | Linux | macOS |
+| --- | --- | --- |
+| Interface naming | as configured (`nm-*`) | kernel-assigned `utunN`, mapped via `/var/run/wireguard/<name>.name` |
+| DNS from the gateway | needs `resolvconf` | applied natively by `wg-quick` |
+| Machine name | `hostname -s` | `scutil --get LocalHostName`, then `ComputerName` |
+| Address lookup | `ip -4 -o addr` | `ifconfig` |
+
+Interface liveness is read from `wg show interfaces`, which behaves the same on both.
+
+macOS can report a hostname like `Unknown_aa:bb:cc:dd:ee:ff` when no name is set. Those colons are not valid in a Netmaker client id, so the derived id is lowercased and stripped to `[A-Za-z0-9._-]` — that example becomes `unknown_aabbccddeeff-cli`, which is ugly but stable. Set `NMRAC_CLIENT_ID` if you want something friendlier.
 
 ## Server compatibility
 
@@ -152,7 +177,9 @@ If you run a different version and something breaks, an issue with your server v
 
 **`no gateway for '<network>'`** — your user is not attached to a remote-access gateway on that network. An admin attaches users to gateways; `nmrac` cannot.
 
-**`--dns needs resolvconf`** — `apt install openresolv`, or drop `--dns`.
+**`--dns needs resolvconf`** — Linux only: `apt install openresolv`, or drop the flag and let DNS be skipped.
+
+**`access denied` on an extclient path** — on v1.5.1 a client that does not exist answers `403 access denied` rather than `404`. `nmrac` treats any non-200 on the existence probe as "not present" and creates the client, so you should not see this; if you do, it is a genuine permission problem on the gateway.
 
 **Tunnel up but nothing reachable** — check `nmrac status` for a recent handshake and non-zero transfer. If those look healthy, the crypto path is fine and you are looking at ACLs or filtering. Note that many gateways drop ICMP, so a failed `ping` proves nothing; try a real port.
 

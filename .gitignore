@@ -1,0 +1,7 @@
+# local state - never commit these
+token
+server
+ifaces
+*.conf
+*.swp
+.DS_Store

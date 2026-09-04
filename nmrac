@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+# nmrac - Netmaker Remote Access Client, CLI edition.
+#
+# Does what Netmaker Desktop does, headless. Targets Netmaker server v1.5.1.
+#
+# Endpoints used, and why these and not others:
+#   ws  /api/oauth/headless                        SSO login (32-char state ->
+#                                                  HandleHeadlessSSOCallback, no
+#                                                  admin check; the 64-char host
+#                                                  state IS admin-gated)
+#   GET /api/users/{user}/remote_access_gw         networks + gateways. Wrapped in
+#                                                  ContinueIfUserMatch, so it needs
+#                                                  no TARGET_RSRC header.
+#   GET    /api/extclients/{net}/{clientid}        does this box have a client?
+#   POST   /api/extclients/{net}/{gwid}            create one
+#   GET    /api/extclients/{net}/{clientid}/file   canonical wg-quick config
+#   DELETE /api/extclients/{net}/{clientid}        remove it
+#
+# The /api/v1/rac/* family is NOT usable here: its authz requires a TARGET_RSRC
+# request header that does not survive the proxy in front of the API, so every
+# call returns 403 "target rsrc is missing". /api/v1/device/* does not exist
+# until a later server release (404 on v1.5.1).
+
+set -euo pipefail
+
+STATE_DIR="${NMRAC_STATE_DIR:-/etc/nmrac}"
+SERVER_FILE="$STATE_DIR/server"
+# Which Netmaker server to talk to: $NMRAC_API, else the URL saved by
+# `nmrac server <url>`. Deliberately not hardcoded.
+API="${NMRAC_API:-}"
+if [ -z "$API" ] && [ -r "$SERVER_FILE" ]; then
+  API="$(tr -d '[:space:]' < "$SERVER_FILE")"
+fi
+API="${API%/}"
+TOKEN_FILE="${NMRAC_TOKEN_FILE:-$STATE_DIR/token}"
+IFMAP="$STATE_DIR/ifaces"
+WG_DIR="${NMRAC_WG_DIR:-/etc/wireguard}"
+# Stable per-machine client identity. The server keys ext-clients off this, so a
+# stable value re-uses the same config and IP instead of allocating a new one.
+CLIENT_ID="${NMRAC_CLIENT_ID:-$(hostname)-cli}"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "must run as root (needs $WG_DIR and wg-quick)"; }
+need_api() {
+  [ -n "$API" ] || die "no server set - run: $0 server https://netmaker.example.com"
+}
+
+cmd_server() {
+  local url="${1:-}"
+  if [ -z "$url" ]; then
+    [ -n "$API" ] && printf '%s\n' "$API" || die "no server set"
+    return 0
+  fi
+  case "$url" in
+    https://*|http://*) ;;
+    *) die "server must be an http(s) URL: $url" ;;
+  esac
+  need_root
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+  printf '%s\n' "${url%/}" > "$SERVER_FILE"; chmod 644 "$SERVER_FILE"
+  note "server set to ${url%/}"
+}
+
+token() {
+  [ -r "$TOKEN_FILE" ] || die "not logged in - run: $0 login"
+  tr -d '[:space:]' < "$TOKEN_FILE"
+}
+
+username() {
+  token | cut -d. -f2 | tr '_-' '/+' \
+    | { read -r p; printf '%s' "$p$(printf '%*s' $(( (4 - ${#p} % 4) % 4 )) '' | tr ' ' '=')"; } \
+    | base64 -d 2>/dev/null | jq -r '.username // .UserName // empty'
+}
+
+# curl wrapper. Returns body on 2xx, dies with the server's message otherwise.
+api() {
+  need_api
+  local method="$1" path="$2" body="${3:-}"
+  local -a args=(-sS -X "$method" -H "Authorization: Bearer $(token)")
+  [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
+  local out code
+  out="$(curl "${args[@]}" -w '\n%{http_code}' "$API$path")" || die "request failed: $path"
+  code="$(printf '%s' "$out" | tail -n1)"
+  out="$(printf '%s' "$out" | sed '$d')"
+  case "$code" in
+    2*) printf '%s' "$out" ;;
+    401) die "unauthorized - token expired, re-run: $0 login" ;;
+    404) printf '%s' "__NOTFOUND__" ;;
+    *)
+      local msg; msg="$(printf '%s' "$out" | jq -r '.Message // empty' 2>/dev/null || true)"
+      die "HTTP $code from $path: ${msg:-$out}"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------- login
+
+ws_login() {
+  NMRAC_WS="${API/#https:/wss:}/api/oauth/headless" node -e '
+const ws = new WebSocket(process.env.NMRAC_WS);
+let gotUrl = false;
+const timer = setTimeout(() => { console.error("timed out waiting for SSO (5 min)"); process.exit(1); }, 300000);
+ws.onmessage = (ev) => {
+  const msg = String(ev.data).trim();
+  if (msg.startsWith("JWT: ")) {
+    clearTimeout(timer);
+    process.stdout.write(msg.slice(5).trim());
+    ws.close(); process.exit(0);
+  }
+  if (!gotUrl) { gotUrl = true; console.error("\nOpen this and sign in:\n\n  " + msg + "\n\nWaiting..."); }
+  else console.error("server: " + msg);
+};
+ws.onerror = (e) => { clearTimeout(timer); console.error("websocket error: " + (e?.message || "connect failed")); process.exit(1); };
+ws.onclose = () => { clearTimeout(timer); if (gotUrl) console.error("server closed before sending a token"); process.exit(1); };
+'
+}
+
+cmd_login() {
+  need_root; need_api
+  local jwt
+  if [ "${1:-}" = "--paste" ]; then
+    note "Sign in at $API/api/oauth/login, then copy the 'login' parameter"
+    note "from the dashboard URL you land on."
+    printf '\nPaste JWT (or the whole URL): ' >&2
+    read -r jwt
+    jwt="$(printf '%s' "$jwt" | tr -d '[:space:]')"
+    case "$jwt" in *login=*) jwt="${jwt#*login=}"; jwt="${jwt%%&*}" ;; esac
+  else
+    command -v node >/dev/null 2>&1 || die "needs node >=22 for WebSocket, or use: $0 login --paste"
+    jwt="$(ws_login)" || die "SSO login failed"
+  fi
+  [ -n "$jwt" ] || die "no token received"
+
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+  printf '%s\n' "$jwt" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"
+  note ""
+  note "authenticated as $(username) - token saved to $TOKEN_FILE"
+}
+
+cmd_logout() {
+  need_root
+  rm -f "$TOKEN_FILE"
+  note "token removed (tunnels left alone; use '$0 disconnect' to drop them)"
+}
+
+# ---------------------------------------------------------------- gateways
+
+# network -> gateway. Note: this endpoint returns a RAW map, not the
+# {Code,Message,Response} envelope the /api/v1/* endpoints use.
+gateways_json() {
+  api GET "/api/users/$(username)/remote_access_gw" \
+    "$(jq -nc --arg c "$CLIENT_ID" '{remote_access_clientid:$c}')"
+}
+
+gw_for_network() {
+  local net="$1"
+  gateways_json | jq -r --arg n "$net" '.[$n][0].remote_access_gw_id // empty'
+}
+
+# wg interface names are capped at 15 chars, and network names here are longer
+# than that, so derive a short one and remember the mapping for display.
+iface_for() {
+  local net="$1" san cand
+  san="$(printf '%s' "$net" | tr -cd '[:alnum:]-')"
+  cand="nm-${san:0:12}"
+  if [ -r "$IFMAP" ]; then
+    local owner; owner="$(awk -v i="$cand" '$1==i{print $2}' "$IFMAP" | head -1)"
+    if [ -n "$owner" ] && [ "$owner" != "$net" ]; then
+      cand="nm-$(printf '%s' "$net" | sha1sum | cut -c1-8)"   # collision
+    fi
+  fi
+  printf '%s' "$cand"
+}
+
+remember_iface() {
+  local iface="$1" net="$2"
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+  touch "$IFMAP"; chmod 600 "$IFMAP"
+  grep -v -e "^$iface " "$IFMAP" > "$IFMAP.tmp" 2>/dev/null || true
+  printf '%s %s\n' "$iface" "$net" >> "$IFMAP.tmp"
+  mv "$IFMAP.tmp" "$IFMAP"
+}
+
+net_for_iface() { [ -r "$IFMAP" ] && awk -v i="$1" '$1==i{print $2}' "$IFMAP" | head -1; }
+
+# ---------------------------------------------------------------- config
+
+# Ensure this machine has its own ext-client on the given network, then return
+# the server-rendered wg-quick config.
+fetch_conf() {
+  local net="$1" gw="$2"
+  local existing
+  existing="$(api GET "/api/extclients/$net/$CLIENT_ID")"
+  if [ "$existing" = "__NOTFOUND__" ]; then
+    note "creating remote-access client '$CLIENT_ID' on $net"
+    local body
+    body="$(jq -nc \
+      --arg id "$CLIENT_ID" --arg dn "$(hostname)" \
+      --arg ov "$( . /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}" )" \
+      --arg kv "$(uname -r)" '{
+        clientid:$id, enabled:true, device_id:$id, device_name:$dn,
+        os:"linux", os_family:"linux", os_version:$ov,
+        kernel_version:$kv, client_version:"nmrac-cli"
+      }')"
+    api POST "/api/extclients/$net/$gw" "$body" >/dev/null
+  fi
+  local conf
+  conf="$(api GET "/api/extclients/$net/$CLIENT_ID/file")"
+  [ "$conf" != "__NOTFOUND__" ] || die "config not available for $CLIENT_ID on $net"
+  printf '%s' "$conf"
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_connect() {
+  need_root
+  local want_dns=false net=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dns) want_dns=true ;;
+      -*) die "unknown flag: $1" ;;
+      *) net="$1" ;;
+    esac
+    shift
+  done
+  if [ -z "$net" ]; then
+    net="$(pick_network)" || exit 1
+    [ -n "$net" ] || { note "cancelled"; exit 0; }
+  fi
+
+  local gw; gw="$(gw_for_network "$net")"
+  [ -n "$gw" ] || die "no gateway for '$net' - check '$0 list'"
+
+  local iface conf; iface="$(iface_for "$net")"
+  conf="$(fetch_conf "$net" "$gw")"
+
+  # The server always emits a DNS line. wg-quick shells out to resolvconf for
+  # it, which is not installed here, so drop it unless asked for explicitly.
+  if [ "$want_dns" = true ]; then
+    command -v resolvconf >/dev/null 2>&1 \
+      || die "--dns needs resolvconf (apt install openresolv), or omit --dns"
+  else
+    conf="$(printf '%s\n' "$conf" | grep -v '^[[:space:]]*DNS[[:space:]]*=')"
+  fi
+
+  mkdir -p "$WG_DIR"; chmod 700 "$WG_DIR"
+  local target="$WG_DIR/$iface.conf"
+  local tmp; tmp="$(mktemp)"; chmod 600 "$tmp"
+  printf '%s\n' "$conf" > "$tmp"
+  grep -q '^PrivateKey = .\+' "$tmp" || { rm -f "$tmp"; die "server returned a config with no private key"; }
+  mv "$tmp" "$target"; chmod 600 "$target"
+  remember_iface "$iface" "$net"
+
+  wg-quick down "$iface" >/dev/null 2>&1 || true
+  wg-quick up "$iface"
+  note ""
+  cmd_status
+}
+
+cmd_disconnect() {
+  need_root
+  local net="${1:-}"
+  if [ -n "$net" ]; then
+    local iface; iface="$(iface_for "$net")"
+    wg-quick down "$iface" || die "not up: $net ($iface)"
+    return 0
+  fi
+  local any=false
+  for f in "$WG_DIR"/nm-*.conf; do
+    [ -e "$f" ] || continue
+    local iface; iface="$(basename "$f" .conf)"
+    if ip link show "$iface" >/dev/null 2>&1; then
+      wg-quick down "$iface" && any=true
+    fi
+  done
+  [ "$any" = true ] || note "(nothing to disconnect)"
+}
+
+# One TSV row per network: net, gwname, state, addr. Shared by list and the
+# interactive picker so both always agree.
+net_rows() {
+  printf '%s' "$1" \
+    | jq -r 'to_entries[] | [.key, (.value[0].gw_name // "-")] | @tsv' \
+    | sort | while IFS=$'\t' read -r net gwname; do
+        local iface state addr
+        iface="$(iface_for "$net")"
+        if ip link show "$iface" >/dev/null 2>&1; then
+          state="on"
+          addr="$(ip -4 -o addr show "$iface" 2>/dev/null | awk '{print $4}' | head -1)"
+        else
+          state="off"; addr=""
+        fi
+        printf '%s\t%s\t%s\t%s\n' "$net" "$gwname" "$state" "$addr"
+      done
+}
+
+# Netmaker Desktop's network list, as text.
+cmd_list() {
+  local gws rows
+  gws="$(gateways_json)"
+  rows="$(net_rows "$gws")"
+  printf 'Networks %s   (user: %s)\n\n' "$(printf '%s\n' "$rows" | grep -c . || true)" "$(username)"
+  while IFS=$'\t' read -r net gwname state addr; do
+    [ -n "$net" ] || continue
+    printf '  [%-3s]  %-28s gw %-16s %s\n' "$state" "$net" "$gwname" "$addr"
+  done <<< "$rows"
+  printf '\n  connect:    %s connect [network]\n' "$0"
+  printf '  disconnect: %s disconnect [network]\n' "$0"
+}
+
+# Prompt for a network. Menu goes to stderr, the chosen name to stdout, so this
+# is safe to use in a command substitution. Prints nothing if cancelled.
+pick_network() {
+  local gws rows; gws="$(gateways_json)"; rows="$(net_rows "$gws")"
+  local -a nets=(); local i=0
+
+  printf '\nNetworks (user: %s)\n\n' "$(username)" >&2
+  while IFS=$'\t' read -r net gwname state addr; do
+    [ -n "$net" ] || continue
+    i=$((i + 1)); nets+=("$net")
+    printf '  %d) [%-3s]  %-28s gw %-16s %s\n' "$i" "$state" "$net" "$gwname" "$addr" >&2
+  done <<< "$rows"
+  [ "$i" -gt 0 ] || die "no networks available to you"
+
+  printf '\nSelect network [1-%d], or q to quit: ' "$i" >&2
+  # Read from the terminal when there is one; fall back to stdin so the menu
+  # also works piped (`echo 1 | nmrac connect`). Opening /dev/tty fails outright
+  # when the process has no controlling terminal, which -r does not catch.
+  local choice=""
+  if [ -t 0 ]; then
+    read -r choice || true
+  elif { exec 3< /dev/tty; } 2>/dev/null; then
+    read -r choice <&3 || true
+    exec 3<&-
+  else
+    read -r choice || true
+  fi
+
+  case "$choice" in
+    q|Q|"") return 0 ;;                       # cancelled - no output
+    *[!0-9]*) die "not a number: $choice" ;;
+  esac
+  [ "$choice" -ge 1 ] && [ "$choice" -le "$i" ] || die "out of range: $choice"
+  printf '%s' "${nets[$((choice - 1))]}"
+}
+
+cmd_status() {
+  need_root
+  local any=false
+  for f in "$WG_DIR"/nm-*.conf; do
+    [ -e "$f" ] || continue
+    local iface net; iface="$(basename "$f" .conf)"; net="$(net_for_iface "$iface")"
+    if ip link show "$iface" >/dev/null 2>&1; then
+      any=true
+      printf '%s (%s): up\n' "${net:-$iface}" "$iface"
+      wg show "$iface" | sed 's/^/  /'
+    fi
+  done
+  [ "$any" = true ] || note "(no tunnel is up)"
+}
+
+cmd_conf() {
+  local net="${1:-}"; [ -n "$net" ] || die "usage: $0 conf <network>"
+  local gw; gw="$(gw_for_network "$net")"
+  [ -n "$gw" ] || die "no gateway for '$net'"
+  fetch_conf "$net" "$gw"
+}
+
+cmd_remove() {
+  need_root
+  local net="${1:-}"; [ -n "$net" ] || die "usage: $0 remove <network>"
+  cmd_disconnect "$net" >/dev/null 2>&1 || true
+  api DELETE "/api/extclients/$net/$CLIENT_ID" >/dev/null
+  rm -f "$WG_DIR/$(iface_for "$net").conf"
+  note "removed client '$CLIENT_ID' from $net"
+}
+
+usage() {
+  cat <<EOF
+nmrac - Netmaker Remote Access Client (CLI) for $API
+
+  $0 server <url>               point at a Netmaker server (once)
+  $0 login [--paste]            SSO login (browser), or paste a JWT
+  $0 logout                     forget the token
+  $0 list                       networks, gateways, on/off state
+  $0 connect [--dns] [network]   bring a tunnel up (prompts if no network)
+  $0 disconnect [network]       take it down (all if omitted)
+  $0 status                     wg peer state
+  $0 conf <network>             print the config the server hands out
+  $0 remove <network>           delete this box's client from the network
+
+Server:    ${API:-<unset - run: $0 server https://netmaker.example.com>}
+Client id: $CLIENT_ID
+EOF
+}
+
+case "${1:-}" in
+  server) shift; cmd_server "$@" ;;
+  login) shift; cmd_login "$@" ;;
+  logout) shift; cmd_logout "$@" ;;
+  list|networks) shift; cmd_list "$@" ;;
+  connect|up) shift; cmd_connect "$@" ;;
+  disconnect|down) shift; cmd_disconnect "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  conf|config) shift; cmd_conf "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage; exit 1 ;;
+esac

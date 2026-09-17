@@ -61,22 +61,60 @@ sha1_hex() {
 # GNU coreutils decodes with -d, BSD/macOS with -D.
 b64_decode() { base64 -d 2>/dev/null || base64 -D 2>/dev/null; }
 
-# macOS `hostname` can return junk such as "Unknown_1a:57:a6:73:75:06" when no
-# name is set, and those characters are not valid in a Netmaker client id.
-default_client_id() {
+# The machine half of a client id. Netmaker validates ids in
+# controllers/regex.go:validName - ^[a-zA-Z0-9-]+$, 5 to 32 characters - so dots
+# and underscores are rejected, not just cosmetic. macOS `hostname` can return
+# junk such as "Unknown_1a:57:a6:73:75:06" when no name is set and DNS names
+# carry dots, so fold every separator to a dash rather than keeping characters
+# the server refuses with "node name must be alphanumderic and/or dashes".
+default_client_base() {
   local h=""
   if [ "$OS_NAME" = "Darwin" ]; then
     h="$(scutil --get LocalHostName 2>/dev/null || true)"
     [ -n "$h" ] || h="$(scutil --get ComputerName 2>/dev/null || true)"
   fi
   [ -n "$h" ] || h="$(hostname -s 2>/dev/null || hostname 2>/dev/null || true)"
-  h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]._-')"
-  h="${h#[-._]}"
+  h="$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]' | tr '._ ' '---' \
+       | tr -cd '[:alnum:]-' | tr -s '-')"
+  h="${h#-}"; h="${h%-}"
   [ -n "$h" ] || h="host-$(printf '%s' "$(uname -a)" | sha1_hex | cut -c1-8)"
-  printf '%s-cli' "$h"
+  printf '%s' "$h"
 }
 
-CLIENT_ID="${NMRAC_CLIENT_ID:-$(default_client_id)}"
+CLIENT_BASE="$(default_client_base)"
+
+# Machine-level id. Two things still want one that is not tied to a network:
+# the gateway listing, where it is only the caller's identity, and the clients
+# this tool created before ids were network-scoped - see resolve_client().
+CLIENT_ID="${NMRAC_CLIENT_ID:-$CLIENT_BASE-cli}"
+
+validate_client_id() {
+  case "$1" in
+    ""|*[!a-zA-Z0-9-]*)
+      die "invalid client id '$1': Netmaker allows letters, digits and dashes only" ;;
+  esac
+  [ "${#1}" -ge 5 ] && [ "${#1}" -le 32 ] \
+    || die "invalid client id '$1': must be 5 to 32 characters"
+}
+
+# The id this machine uses on one network. Netmaker requires ext-client ids to
+# be unique across the WHOLE server, not within a network: isValid() in
+# controllers/ext_client.go checks a new id against logic.GetAllExtClients().
+# So a single id per machine only ever works on one network - connecting to a
+# second one fails with HTTP 400 "client validation: duplicate client name".
+# Hence one id per network, with the network folded into a short hash because
+# validName caps the whole id at 32 characters.
+client_id_for() {
+  local net="$1" base id
+  if [ -n "${NMRAC_CLIENT_ID:-}" ]; then
+    id="$NMRAC_CLIENT_ID"
+  else
+    base="$(printf '%s' "$CLIENT_BASE" | cut -c1-25)"; base="${base%-}"
+    id="$base-$(printf '%s' "$net" | sha1_hex | cut -c1-6)"
+  fi
+  validate_client_id "$id"
+  printf '%s' "$id"
+}
 
 # wg-quick on macOS cannot name the interface, so it creates a utunN device and
 # records the real name in /var/run/wireguard/<name>.name.
@@ -295,25 +333,53 @@ net_for_iface() { [ -r "$IFMAP" ] && awk -v i="$1" '$1==i{print $2}' "$IFMAP" | 
 # ------------------------------------------------------------ config
 
 client_body() {
+  local id="$1"
   jq -nc \
-    --arg id "$CLIENT_ID" --arg dn "$(hostname 2>/dev/null || printf '%s' "$CLIENT_ID")" \
+    --arg id "$id" --arg dn "$(hostname 2>/dev/null || printf '%s' "$id")" \
     --argjson osf "$(host_os_fields)" \
     '{clientid:$id, enabled:true, device_id:$id, device_name:$dn,
       client_version:"nmrac-cli"} + $osf'
+}
+
+# Which id this machine goes by on a network, and whether it is already there.
+# Globals because bash 3.2 (stock macOS) cannot return a pair and both callers
+# need one.
+RESOLVED_ID=""
+RESOLVED_EXISTS=false
+
+resolve_client() {
+  local net="$1" legacy
+  RESOLVED_ID="$(client_id_for "$net")"
+  RESOLVED_EXISTS=false
+  # A client that does not exist answers 403 "access denied" on this server,
+  # not 404 - so treat anything non-200 as "not present" and let the create
+  # call be what reports a genuine permission problem.
+  if [ "$(http_code GET "/api/extclients/$net/$RESOLVED_ID")" = "200" ]; then
+    RESOLVED_EXISTS=true
+    return 0
+  fi
+  # Before ids were network-scoped this tool created "<machine>-cli". Keep using
+  # one that is still on the network rather than creating a second client beside
+  # it, which would strand the old one and the address it holds.
+  legacy="$CLIENT_ID"
+  if [ "$legacy" != "$RESOLVED_ID" ] &&
+     [ "$(http_code GET "/api/extclients/$net/$legacy")" = "200" ]; then
+    RESOLVED_ID="$legacy"
+    RESOLVED_EXISTS=true
+  fi
+  return 0
 }
 
 # Ensure this machine has its own ext-client on the given network, then return
 # the server-rendered wg-quick config.
 fetch_conf() {
   local net="$1" gw="$2"
-  # A client that does not exist answers 403 "access denied" on this server,
-  # not 404 - so treat anything non-200 as "not present" and let the create
-  # call be what reports a genuine permission problem.
-  if [ "$(http_code GET "/api/extclients/$net/$CLIENT_ID")" != "200" ]; then
-    note "creating remote-access client '$CLIENT_ID' on $net"
-    api POST "/api/extclients/$net/$gw" "$(client_body)" >/dev/null
+  resolve_client "$net"
+  if [ "$RESOLVED_EXISTS" != true ]; then
+    note "creating remote-access client '$RESOLVED_ID' on $net"
+    api POST "/api/extclients/$net/$gw" "$(client_body "$RESOLVED_ID")" >/dev/null
   fi
-  api GET "/api/extclients/$net/$CLIENT_ID/file"
+  api GET "/api/extclients/$net/$RESOLVED_ID/file"
 }
 
 # ------------------------------------------------------------ commands
@@ -491,12 +557,19 @@ cmd_remove() {
   need_root; need_cmd curl jq
   local net="${1:-}"; [ -n "$net" ] || die "usage: $0 remove <network>"
   cmd_disconnect "$net" >/dev/null 2>&1 || true
-  api DELETE "/api/extclients/$net/$CLIENT_ID" >/dev/null
+  resolve_client "$net"
+  api DELETE "/api/extclients/$net/$RESOLVED_ID" >/dev/null
   rm -f "$WG_DIR/$(iface_for "$net").conf"
-  note "removed client '$CLIENT_ID' from $net"
+  note "removed client '$RESOLVED_ID' from $net"
 }
 
 usage() {
+  local idline
+  if [ -n "${NMRAC_CLIENT_ID:-}" ]; then
+    idline="$NMRAC_CLIENT_ID (NMRAC_CLIENT_ID, used on every network)"
+  else
+    idline="$CLIENT_BASE-<network hash> (one per network)"
+  fi
   cat <<EOF
 nmrac - Netmaker Remote Access Client (CLI)
 
@@ -512,7 +585,7 @@ nmrac - Netmaker Remote Access Client (CLI)
 
 Platform:  $OS_NAME
 Server:    ${API:-<unset - run: $0 server https://netmaker.example.com>}
-Client id: $CLIENT_ID
+Client id: $idline
 EOF
 }
 

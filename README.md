@@ -91,14 +91,18 @@ sudo nmrac disconnect
 | `nmrac conf <network>` | Print the config the server hands out, without applying it. |
 | `nmrac remove <network>` | Delete this machine's client from a network, server-side. |
 
-`connect` is idempotent. Each machine gets its own external client, keyed on a stable client id (`$(hostname)-cli`, override with `NMRAC_CLIENT_ID`), so reconnecting reuses the same client and IP rather than allocating a new one on every call. It will not touch a client belonging to another device.
+`connect` is idempotent. Each machine gets its own external client on each network, keyed on a stable client id, so reconnecting reuses the same client and IP rather than allocating a new one on every call. It will not touch a client belonging to another device.
+
+That id is `<machine>-<6 hex of the network name>` — **one per network, not one per machine**. Netmaker requires ext-client ids to be unique across the *whole server* rather than within a network: `isValid` in `controllers/ext_client.go` checks every new id against `logic.GetAllExtClients()`. A single id per machine can therefore only ever join one network, and the second `connect` fails with `400 client validation: duplicate client name`.
+
+`NMRAC_CLIENT_ID` still pins an exact name, but it is then used on every network, so the same one-network limit applies to it. Clients created by older versions of `nmrac` are named `<machine>-cli`; one that is still present on a network keeps being used, so upgrading neither strands it nor creates a duplicate beside it.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `NMRAC_API` | from `/etc/nmrac/server` | Server URL; overrides the saved one |
-| `NMRAC_CLIENT_ID` | `$(hostname)-cli` | This machine's client identity |
+| `NMRAC_CLIENT_ID` | `$(hostname)-<network hash>` | Exact client id to use. Applies to every network |
 | `NMRAC_STATE_DIR` | `/etc/nmrac` | Token, server URL, interface map |
 | `NMRAC_WG_DIR` | `/etc/wireguard` | Where `.conf` files are written |
 
@@ -158,7 +162,7 @@ Both arrive at the same `/api/oauth/register/{regKey}` URL, but a 64-character s
 
 Interface liveness is read from `wg show interfaces`, which behaves the same on both.
 
-macOS can report a hostname like `Unknown_aa:bb:cc:dd:ee:ff` when no name is set. Those colons are not valid in a Netmaker client id, so the derived id is lowercased and stripped to `[A-Za-z0-9._-]` — that example becomes `unknown_aabbccddeeff-cli`, which is ugly but stable. Set `NMRAC_CLIENT_ID` if you want something friendlier.
+Netmaker accepts `^[a-zA-Z0-9-]+$`, 5 to 32 characters, in a client id (`controllers/regex.go:validName`) — no dots and no underscores, and it rejects the rest outright rather than cleaning them up. So the machine name is lowercased, every separator is folded to a dash, anything else is dropped, and a long one is truncated to leave room for the network suffix. A macOS hostname like `Unknown_aa:bb:cc:dd:ee:ff` becomes `unknown-aabbccddeeff`, which is ugly but stable. Set `NMRAC_CLIENT_ID` if you want something friendlier.
 
 ## Server compatibility
 
@@ -180,6 +184,8 @@ If you run a different version and something breaks, an issue with your server v
 **`--dns needs resolvconf`** — Linux only: `apt install openresolv`, or drop the flag and let DNS be skipped.
 
 **`access denied` on an extclient path** — on v1.5.1 a client that does not exist answers `403 access denied` rather than `404`. `nmrac` treats any non-200 on the existence probe as "not present" and creates the client, so you should not see this; if you do, it is a genuine permission problem on the gateway.
+
+**`400 client validation: duplicate client name`** — ext-client ids are unique across the whole server, not per network, so the id is already taken on another network. `nmrac` scopes ids per network and should not hit this; if you set `NMRAC_CLIENT_ID`, that one name is used everywhere, so either vary it per network or `nmrac remove` the client holding it.
 
 **Tunnel up but nothing reachable** — check `nmrac status` for a recent handshake and non-zero transfer. If those look healthy, the crypto path is fine and you are looking at ACLs or filtering. Note that many gateways drop ICMP, so a failed `ping` proves nothing; try a real port.
 

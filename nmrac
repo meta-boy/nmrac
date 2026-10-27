@@ -83,10 +83,28 @@ default_client_base() {
 
 CLIENT_BASE="$(default_client_base)"
 
-# Machine-level id. Two things still want one that is not tied to a network:
-# the gateway listing, where it is only the caller's identity, and the clients
-# this tool created before ids were network-scoped - see resolve_client().
-CLIENT_ID="${NMRAC_CLIENT_ID:-$CLIENT_BASE-cli}"
+# An id given on purpose: `connect --id`, or NMRAC_CLIENT_ID for every network.
+EXPLICIT_ID="${NMRAC_CLIENT_ID:-}"
+
+# A per-machine id that survives renames. The hostname does not: macOS rewrites
+# LocalHostName to "Name-2" when another host on the LAN claims the same Bonjour
+# name, which changed every hostname-derived client id, so nmrac stopped finding
+# its own clients and tried to create new ones. Hardware UUID on macOS,
+# machine-id on Linux, prefixed so it never equals the id Netmaker Desktop
+# registers for the same machine.
+machine_device_id() {
+  local u=""
+  if [ "$OS_NAME" = "Darwin" ]; then
+    u="$(ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+         | awk -F'"' '/IOPlatformUUID/{print $4; exit}')"
+  else
+    u="$(cat /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null | head -1)"
+  fi
+  [ -n "$u" ] || u="$(printf '%s' "$CLIENT_BASE" | sha1_hex)"
+  printf 'nmrac-%s' "$(printf '%s' "$u" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-')"
+}
+
+DEVICE_ID="${NMRAC_DEVICE_ID:-$(machine_device_id)}"
 
 validate_client_id() {
   case "$1" in
@@ -106,12 +124,18 @@ validate_client_id() {
 # validName caps the whole id at 32 characters.
 client_id_for() {
   local net="$1" base id
-  if [ -n "${NMRAC_CLIENT_ID:-}" ]; then
-    id="$NMRAC_CLIENT_ID"
-  else
-    base="$(printf '%s' "$CLIENT_BASE" | cut -c1-25)"; base="${base%-}"
-    id="$base-$(printf '%s' "$net" | sha1_hex | cut -c1-6)"
-  fi
+  base="$(printf '%s' "$CLIENT_BASE" | cut -c1-25)"; base="${base%-}"
+  id="$base-$(printf '%s' "$net" | sha1_hex | cut -c1-6)"
+  validate_client_id "$id"
+  printf '%s' "$id"
+}
+
+# Same shape plus 4 random hex, for when the derived name is already taken on
+# the server by something that is not ours.
+fresh_client_id() {
+  local net="$1" base id
+  base="$(printf '%s' "$CLIENT_BASE" | cut -c1-20)"; base="${base%-}"
+  id="$base-$(printf '%s' "$net" | sha1_hex | cut -c1-6)-$(od -An -N2 -tx1 /dev/urandom | tr -d ' \n')"
   validate_client_id "$id"
   printf '%s' "$id"
 }
@@ -295,13 +319,29 @@ cmd_logout() {
 
 # network -> gateway. Note: this endpoint returns a RAW map, not the
 # {Code,Message,Response} envelope the /api/v1/* endpoints use.
+#
+# It also reports, as gw_client, the caller's existing client on each gateway -
+# but only clients carrying a remote_access_client_id, and with device_id set
+# only the one whose device_id matches (getUserRemoteAccessGwsV1 in
+# pro/controllers/users.go). Without device_id it falls back to the user's
+# first client on that gateway, which may belong to another device.
 gateways_json() {
-  api GET "/api/users/$(username)/remote_access_gw" \
-    "$(jq -nc --arg c "$CLIENT_ID" '{remote_access_clientid:$c}')"
+  api GET "/api/users/$(username)/remote_access_gw?remote_access_clientid=$DEVICE_ID&device_id=$DEVICE_ID"
 }
 
 gw_for_network() {
-  gateways_json | jq -r --arg n "$1" '.[$n][0].remote_access_gw_id // empty'
+  local gws="${2:-}"
+  [ -n "$gws" ] || gws="$(gateways_json)"
+  printf '%s' "$gws" | jq -r --arg n "$1" '.[$n][0].remote_access_gw_id // empty'
+}
+
+# The client the server holds for THIS device on a network, if any.
+server_client_for() {
+  local net="$1" gws="${2:-}"
+  [ -n "$gws" ] || gws="$(gateways_json)"
+  printf '%s' "$gws" | jq -r --arg n "$net" --arg d "$DEVICE_ID" '
+    [.[$n][]? | .gw_client // {} | select(.device_id == $d or .remote_access_client_id == $d)
+     | .clientid // empty | select(. != "")][0] // empty'
 }
 
 # Interface names are capped at 15 chars on Linux, and Netmaker network names
@@ -330,16 +370,43 @@ remember_iface() {
 
 net_for_iface() { [ -r "$IFMAP" ] && awk -v i="$1" '$1==i{print $2}' "$IFMAP" | head -1; }
 
+# network -> client id this machine last connected with. Once a client is
+# found or created its id is pinned here, so a later hostname change cannot
+# send nmrac looking for, or creating, a different one.
+CLIENTS_FILE="$STATE_DIR/clients"
+
+pinned_id() { [ -r "$CLIENTS_FILE" ] && awk -v n="$1" '$1==n{print $2}' "$CLIENTS_FILE" | head -1; }
+
+pin_client() {
+  local net="$1" id="$2"
+  # `conf` runs without root; it can use a pin but not write one.
+  [ -w "$STATE_DIR" ] || return 0
+  [ "$(pinned_id "$net" || true)" = "$id" ] && return 0
+  touch "$CLIENTS_FILE"; chmod 600 "$CLIENTS_FILE"
+  awk -v n="$net" '$1!=n' "$CLIENTS_FILE" > "$CLIENTS_FILE.tmp" || true
+  printf '%s %s\n' "$net" "$id" >> "$CLIENTS_FILE.tmp"
+  mv "$CLIENTS_FILE.tmp" "$CLIENTS_FILE"
+}
+
 # ------------------------------------------------------------ config
 
+# device_id and remote_access_client_id are what let the server recognise this
+# machine later: the gateway listing reports a client back only when it has a
+# remote_access_client_id, and refuses a second client with the same device_id
+# on a gateway ("remote client config already exists on the gateway").
 client_body() {
   local id="$1"
   jq -nc \
-    --arg id "$id" --arg dn "$(hostname 2>/dev/null || printf '%s' "$id")" \
+    --arg id "$id" --arg dev "$DEVICE_ID" \
+    --arg dn "$(hostname 2>/dev/null || printf '%s' "$id")" \
     --argjson osf "$(host_os_fields)" \
-    '{clientid:$id, enabled:true, device_id:$id, device_name:$dn,
-      client_version:"nmrac-cli"} + $osf'
+    '{clientid:$id, enabled:true, device_id:$dev, remote_access_client_id:$dev,
+      device_name:$dn, client_version:"nmrac-cli"} + $osf'
 }
+
+# A client that does not exist answers 403 "access denied" on this server, not
+# 404 - so anything non-200 means "not usable by us".
+client_exists() { [ "$(http_code GET "/api/extclients/$1/$2")" = "200" ]; }
 
 # Which id this machine goes by on a network, and whether it is already there.
 # Globals because bash 3.2 (stock macOS) cannot return a pair and both callers
@@ -347,39 +414,275 @@ client_body() {
 RESOLVED_ID=""
 RESOLVED_EXISTS=false
 
+# Tried in order, first one that exists wins:
+#   1. an explicit id (--id, NMRAC_CLIENT_ID) - used as given, created if absent
+#   2. the id pinned on the last successful connect
+#   3. the client the server reports for this device id
+#   4. hostname-derived ids from older versions: "<machine>-<net hash>", then
+#      "<machine>-cli", so upgrading neither strands a client nor duplicates it
 resolve_client() {
-  local net="$1" legacy
-  RESOLVED_ID="$(client_id_for "$net")"
+  local net="$1" gws="${2:-}" cand pinned found
   RESOLVED_EXISTS=false
-  # A client that does not exist answers 403 "access denied" on this server,
-  # not 404 - so treat anything non-200 as "not present" and let the create
-  # call be what reports a genuine permission problem.
-  if [ "$(http_code GET "/api/extclients/$net/$RESOLVED_ID")" = "200" ]; then
-    RESOLVED_EXISTS=true
+  if [ -n "$EXPLICIT_ID" ]; then
+    validate_client_id "$EXPLICIT_ID"
+    RESOLVED_ID="$EXPLICIT_ID"
+    client_exists "$net" "$RESOLVED_ID" && RESOLVED_EXISTS=true
     return 0
   fi
-  # Before ids were network-scoped this tool created "<machine>-cli". Keep using
-  # one that is still on the network rather than creating a second client beside
-  # it, which would strand the old one and the address it holds.
-  legacy="$CLIENT_ID"
-  if [ "$legacy" != "$RESOLVED_ID" ] &&
-     [ "$(http_code GET "/api/extclients/$net/$legacy")" = "200" ]; then
-    RESOLVED_ID="$legacy"
-    RESOLVED_EXISTS=true
+  pinned="$(pinned_id "$net" || true)"
+  if [ -n "$pinned" ] && client_exists "$net" "$pinned"; then
+    RESOLVED_ID="$pinned"; RESOLVED_EXISTS=true; return 0
   fi
+  found="$(server_client_for "$net" "$gws")"
+  if [ -n "$found" ]; then
+    RESOLVED_ID="$found"; RESOLVED_EXISTS=true; return 0
+  fi
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    if client_exists "$net" "$cand"; then
+      RESOLVED_ID="$cand"; RESOLVED_EXISTS=true; return 0
+    fi
+  done <<EOF
+$(legacy_ids_for "$net")
+EOF
+  RESOLVED_ID="${pinned:-$(client_id_for "$net")}"
   return 0
+}
+
+# Hostname-derived ids an older nmrac may have created here. macOS appends
+# "-2", "-3" ... to LocalHostName when it meets a Bonjour name clash, so also
+# try the name without that suffix - it is usually what the clients were
+# created under.
+legacy_ids_for() {
+  local net="$1" h base
+  for base in "$CLIENT_BASE" "$(printf '%s' "$CLIENT_BASE" | sed -E 's/-[0-9]+$//')"; do
+    [ -n "$base" ] || continue
+    h="$(printf '%s' "$base" | cut -c1-25)"; h="${h%-}"
+    printf '%s-%s\n%s-cli\n' "$h" "$(printf '%s' "$net" | sha1_hex | cut -c1-6)" "$base"
+  done | awk '!seen[$0]++'
+}
+
+# Create RESOLVED_ID on a network. The server refuses in two ways that mean the
+# client we want effectively exists already, so treat those as "found it":
+#   "remote client config already exists on the gateway" - this device id has
+#       a client there; the server says so instead of returning it
+#   "duplicate client name" - the id exists somewhere on the server (ids are
+#       server-wide, see client_id_for); fine if it is ours on this network
+create_client() {
+  local net="$1" gw="$2" r code msg found
+  note "creating remote-access client '$RESOLVED_ID' on $net"
+  r="$(http_raw POST "/api/extclients/$net/$gw" "$(client_body "$RESOLVED_ID")")"
+  code="$(printf '%s' "$r" | head -n1)"
+  case "$code" in
+    2*) return 0 ;;
+    000) die "could not reach $API" ;;
+    401) die "unauthorized - token expired, re-run: $0 login" ;;
+  esac
+  msg="$(printf '%s' "$r" | tail -n +2 | jq -r '.Message // empty' 2>/dev/null || true)"
+  case "$msg" in
+    *"already exists on the gateway"*)
+      found="$(server_client_for "$net")"
+      [ -n "$found" ] || die "server says this device already has a client on $net but does not report it - pass --id <clientid>"
+      note "server already has client '$found' for this device on $net - using it"
+      RESOLVED_ID="$found"; return 0 ;;
+    *"duplicate client name"*)
+      client_exists "$net" "$RESOLVED_ID" && return 0
+      [ -z "$EXPLICIT_ID" ] || die "client id '$RESOLVED_ID' is taken on this server by another network or user - pick another --id"
+      RESOLVED_ID="$(fresh_client_id "$net")"
+      note "that name is taken elsewhere on the server - creating '$RESOLVED_ID' instead"
+      api POST "/api/extclients/$net/$gw" "$(client_body "$RESOLVED_ID")" >/dev/null
+      return 0 ;;
+  esac
+  die "HTTP $code creating client on $net: ${msg:-$(printf '%s' "$r" | tail -n +2)}"
 }
 
 # Ensure this machine has its own ext-client on the given network, then return
 # the server-rendered wg-quick config.
 fetch_conf() {
-  local net="$1" gw="$2"
-  resolve_client "$net"
-  if [ "$RESOLVED_EXISTS" != true ]; then
-    note "creating remote-access client '$RESOLVED_ID' on $net"
-    api POST "/api/extclients/$net/$gw" "$(client_body "$RESOLVED_ID")" >/dev/null
-  fi
+  local net="$1" gw="$2" gws="${3:-}"
+  resolve_client "$net" "$gws"
+  [ "$RESOLVED_EXISTS" = true ] || create_client "$net" "$gw"
+  pin_client "$net" "$RESOLVED_ID"
   api GET "/api/extclients/$net/$RESOLVED_ID/file"
+}
+
+# ------------------------------------------------------------ dns (macOS)
+#
+# macOS wg-quick writes the tunnel's DNS onto EVERY network service with
+# networksetup - and onto services that appear later, such as another VPN - and
+# keeps the old values only in the memory of the route monitor it backgrounds.
+# If that monitor is gone before the tunnel is (sleep, a reboot with the tunnel
+# up, a killed shell, /var/run/wireguard cleared by hand), nothing puts them
+# back: every service keeps pointing at a resolver that is only reachable
+# through the tunnel, and all name lookups fail. So nmrac snapshots the
+# services itself on connect, and on disconnect repairs any service still
+# pointing at a tunnel that is down.
+#
+# Linux needs none of this: wg-quick hands DNS to resolvconf, which removes it
+# with the interface.
+
+DNS_DIR="$STATE_DIR/dns"
+
+# IPs, and search domains, from a config's DNS lines - wg-quick treats every
+# entry that does not parse as an address as a search domain.
+conf_dns() {
+  [ -r "$1" ] || return 0
+  sed -n 's/^[[:space:]]*DNS[[:space:]]*=//p' "$1" | tr ',' '\n' | tr -d ' \t' \
+    | grep -E '^[0-9A-Fa-f.:]+$' || true
+}
+conf_dns_search() {
+  [ -r "$1" ] || return 0
+  sed -n 's/^[[:space:]]*DNS[[:space:]]*=//p' "$1" | tr ',' '\n' | tr -d ' \t' \
+    | grep -v -E '^[0-9A-Fa-f.:]+$' | grep . || true
+}
+
+services() { networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | sed 's/^\*//'; }
+
+# A service's servers or search domains on one line, or "Empty". networksetup
+# answers a sentence ("There aren't any ...") when none are set; wg-quick spots
+# that by the space, and so do we.
+svc_dns() {
+  local out; out="$(networksetup -getdnsservers "$1" 2>/dev/null | tr '\n' ' ')"; out="${out% }"
+  case "$out" in ""|*"aren't"*|*"Error"*) printf 'Empty' ;; *) printf '%s' "$out" ;; esac
+}
+svc_search() {
+  local out; out="$(networksetup -getsearchdomains "$1" 2>/dev/null | tr '\n' ' ')"; out="${out% }"
+  case "$out" in ""|*"aren't"*|*"Error"*) printf 'Empty' ;; *) printf '%s' "$out" ;; esac
+}
+
+# DNS IPs of every nm-* tunnel that is not up: nothing should point at these.
+dead_dns_ips() {
+  local f iface
+  for f in "$WG_DIR"/nm-*.conf; do
+    [ -e "$f" ] || continue
+    iface="$(basename "$f" .conf)"
+    iface_up "$iface" || conf_dns "$f"
+  done | sort -u
+}
+
+# Does a space-separated server list contain any IP from a newline list?
+uses_any() {
+  local servers=" $1 " ip
+  while IFS= read -r ip; do
+    [ -n "$ip" ] || continue
+    case "$servers" in *" $ip "*) return 0 ;; esac
+  done <<EOF
+$2
+EOF
+  return 1
+}
+
+flush_dns_cache() {
+  dscacheutil -flushcache 2>/dev/null || true
+  killall -HUP mDNSResponder 2>/dev/null || true
+}
+
+# Record every service's DNS before wg-quick overwrites it. Values that already
+# point at one of our tunnels are leftovers, not settings, so they are saved as
+# Empty. A tunnel that is already up keeps its earlier snapshot - the services
+# carry its DNS now, not the user's.
+dns_snapshot() {
+  local iface="$1" conf="$2" tunnel svc d s
+  [ "$OS_NAME" = "Darwin" ] || return 0
+  tunnel="$(conf_dns "$conf")"; [ -n "$tunnel" ] || return 0
+  if iface_up "$iface" && [ -s "$DNS_DIR/$iface" ]; then return 0; fi
+  tunnel="$(printf '%s\n%s\n' "$tunnel" "$(dead_dns_ips)")"
+  mkdir -p "$DNS_DIR"; chmod 700 "$DNS_DIR"
+  services | while IFS= read -r svc; do
+    [ -n "$svc" ] || continue
+    d="$(svc_dns "$svc")"; s="$(svc_search "$svc")"
+    uses_any "$d" "$tunnel" && { d=Empty; s=Empty; }
+    printf '%s\t%s\t%s\n' "$svc" "$d" "$s"
+  done > "$DNS_DIR/$iface.tmp"
+  chmod 600 "$DNS_DIR/$iface.tmp"; mv "$DNS_DIR/$iface.tmp" "$DNS_DIR/$iface"
+}
+
+# Put back every service still pointing at a tunnel that is down: from a
+# snapshot when one names the service, else Empty (= use what DHCP hands out).
+# Prints how many services were fixed.
+dns_repair() {
+  local dead svc d want_d want_s fixed=0 f
+  [ "$OS_NAME" = "Darwin" ] || { printf '0'; return 0; }
+  dead="$(dead_dns_ips)"; [ -n "$dead" ] || { printf '0'; return 0; }
+  while IFS= read -r svc; do
+    [ -n "$svc" ] || continue
+    d="$(svc_dns "$svc")"
+    uses_any "$d" "$dead" || continue
+    want_d=Empty; want_s=Empty
+    for f in "$DNS_DIR"/nm-*; do
+      [ -r "$f" ] || continue
+      case "$f" in *.tmp) continue ;; esac
+      if awk -F'\t' -v s="$svc" '$1==s{found=1} END{exit !found}' "$f"; then
+        want_d="$(awk -F'\t' -v s="$svc" '$1==s{print $2; exit}' "$f")"
+        want_s="$(awk -F'\t' -v s="$svc" '$1==s{print $3; exit}' "$f")"
+        break
+      fi
+    done
+    uses_any "$want_d" "$dead" && { want_d=Empty; want_s=Empty; }
+    # Unquoted on purpose: a server list is several arguments.
+    # shellcheck disable=SC2086
+    networksetup -setdnsservers "$svc" $want_d >/dev/null 2>&1 || true
+    # shellcheck disable=SC2086
+    networksetup -setsearchdomains "$svc" ${want_s:-Empty} >/dev/null 2>&1 || true
+    fixed=$((fixed + 1))
+  done <<EOF
+$(services)
+EOF
+  [ "$fixed" -eq 0 ] || flush_dns_cache
+  printf '%s' "$fixed"
+}
+
+# After `wg-quick down` its route monitor restores DNS on its own, a moment
+# later and from values it captured at `up` - which may themselves be stale. So
+# wait for it to settle, then repair whatever is still wrong.
+dns_cleanup() {
+  [ "$OS_NAME" = "Darwin" ] || return 0
+  local i n total=0 f iface
+  for i in 1 2 3; do
+    sleep 1
+    n="$(dns_repair)"; total=$((total + n))
+    [ "$n" -gt 0 ] || [ "$i" -lt 2 ] || break
+  done
+  [ "$total" -eq 0 ] || note "dns: restored $total network service(s) that still pointed at a closed tunnel"
+  for f in "$DNS_DIR"/nm-*; do
+    [ -e "$f" ] || continue
+    iface="$(basename "$f")"
+    iface_up "$iface" || rm -f "$f"
+  done
+}
+
+# /var/run/wireguard/<iface>.name outliving its utun makes wg-quick believe the
+# interface still exists. Clear ours, and only ours.
+clear_stale_runtime() {
+  [ "$OS_NAME" = "Darwin" ] || return 0
+  local f iface dev
+  for f in /var/run/wireguard/nm-*.name; do
+    [ -e "$f" ] || continue
+    iface="$(basename "$f" .name)"; dev="$(tr -d '[:space:]' < "$f")"
+    if ! iface_up "$iface"; then
+      rm -f "$f" "/var/run/wireguard/$dev.sock"
+      note "cleared stale runtime state for $iface ($dev)"
+    fi
+  done
+}
+
+# Tailscale also lives in 100.64.0.0/10, and Netmaker networks often do too.
+# The tunnel's routes are more specific so they win, but a Tailscale exit node
+# sends DNS and everything else its own way. Warn; do not guess for the user.
+warn_tailscale_overlap() {
+  local conf="$1" ts
+  printf '%s\n' "$conf" \
+    | grep -q -E '^[[:space:]]*(Address|DNS)[[:space:]]*=[^#]*[ ,]100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.' \
+    || return 0
+  ts="$(command -v tailscale 2>/dev/null || true)"
+  [ -n "$ts" ] || [ ! -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ] \
+    || ts=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+  [ -n "$ts" ] || return 0
+  if "$ts" status --json 2>/dev/null | jq -e '.ExitNodeStatus != null' >/dev/null 2>&1; then
+    note "warning: a Tailscale exit node is in use, and this network shares Tailscale's"
+    note "         100.64.0.0/10 range. Its DNS and traffic may not reach the tunnel;"
+    note "         turn the exit node off while connected."
+  fi
 }
 
 # ------------------------------------------------------------ commands
@@ -391,21 +694,28 @@ cmd_connect() {
     case "$1" in
       --dns) dns_mode=on ;;
       --no-dns) dns_mode=off ;;
+      --id) [ $# -ge 2 ] || die "--id needs a client id"; shift; EXPLICIT_ID="$1" ;;
+      --id=*) EXPLICIT_ID="${1#--id=}" ;;
       -*) die "unknown flag: $1" ;;
       *) net="$1" ;;
     esac
     shift
   done
+  [ -z "$EXPLICIT_ID" ] || validate_client_id "$EXPLICIT_ID"
+  # Leftovers first: they would also break resolving the Netmaker server.
+  clear_stale_runtime
+  auto_fix_dns
   if [ -z "$net" ]; then
     net="$(pick_network)" || exit 1
     [ -n "$net" ] || { note "cancelled"; exit 0; }
   fi
 
-  local gw; gw="$(gw_for_network "$net")"
+  local gws gw; gws="$(gateways_json)"; gw="$(gw_for_network "$net" "$gws")"
   [ -n "$gw" ] || die "no gateway for '$net' - check '$0 list'"
 
   local iface conf; iface="$(iface_for "$net")"
-  conf="$(fetch_conf "$net" "$gw")"
+  conf="$(fetch_conf "$net" "$gw" "$gws")"
+  warn_tailscale_overlap "$conf"
 
   # The server always emits a DNS line. Keep it only where wg-quick can apply
   # it, otherwise the tunnel fails to come up at all.
@@ -424,9 +734,12 @@ cmd_connect() {
   tmp="$(mktemp_file)"; chmod 600 "$tmp"
   printf '%s\n' "$conf" > "$tmp"
   grep -q '^PrivateKey = .\+' "$tmp" || { rm -f "$tmp"; die "server returned a config with no private key"; }
+  # Snapshot the services before wg-quick rewrites them.
+  dns_snapshot "$iface" "$tmp"
   mv "$tmp" "$target"; chmod 600 "$target"
   remember_iface "$iface" "$net"
 
+  clear_stale_runtime
   wg-quick down "$iface" >/dev/null 2>&1 || true
   wg-quick up "$iface"
   note ""
@@ -435,21 +748,44 @@ cmd_connect() {
 
 cmd_disconnect() {
   need_root; need_cmd wg wg-quick
-  local net="${1:-}"
+  local net="${1:-}" any=false f iface
   if [ -n "$net" ]; then
-    local iface; iface="$(iface_for "$net")"
-    wg-quick down "$iface" || die "not up: $net ($iface)"
+    iface="$(iface_for "$net")"
+    if iface_up "$iface"; then
+      wg-quick down "$iface" || note "wg-quick down $iface failed"
+      any=true
+    else
+      note "not up: $net ($iface)"
+    fi
+  else
+    for f in "$WG_DIR"/nm-*.conf; do
+      [ -e "$f" ] || continue
+      iface="$(basename "$f" .conf)"
+      if iface_up "$iface"; then
+        wg-quick down "$iface" || note "wg-quick down $iface failed"
+        any=true
+      fi
+    done
+    [ "$any" = true ] || note "(nothing to disconnect)"
+  fi
+  # Even with nothing up: this is also how leftovers from a tunnel that died
+  # without cleaning up get removed.
+  clear_stale_runtime
+  dns_cleanup
+}
+
+# Repair DNS left behind by tunnels that are no longer up, without touching
+# any that are. What `disconnect` does after taking a tunnel down, on its own.
+cmd_fix_dns() {
+  need_root
+  if [ "$OS_NAME" != "Darwin" ]; then
+    note "nothing to do on Linux: resolvconf drops tunnel DNS with the interface"
     return 0
   fi
-  local any=false f iface
-  for f in "$WG_DIR"/nm-*.conf; do
-    [ -e "$f" ] || continue
-    iface="$(basename "$f" .conf)"
-    if iface_up "$iface"; then
-      wg-quick down "$iface" && any=true
-    fi
-  done
-  [ "$any" = true ] || note "(nothing to disconnect)"
+  clear_stale_runtime
+  local n; n="$(dns_repair)"
+  flush_dns_cache
+  note "dns: restored $n network service(s) that pointed at a closed tunnel; cache flushed"
 }
 
 # One TSV row per network: net, gwname, state, addr. Shared by list and the
@@ -471,6 +807,7 @@ net_rows() {
 
 cmd_list() {
   need_cmd curl jq
+  auto_fix_dns
   local gws rows tab; tab="$(printf '\t')"
   gws="$(gateways_json)"
   rows="$(net_rows "$gws")"
@@ -539,10 +876,39 @@ cmd_status() {
       else
         printf '%s (%s): up\n' "${net:-$iface}" "$iface"
       fi
+      [ -z "$net" ] || [ -z "$(pinned_id "$net" || true)" ] \
+        || printf '  client: %s\n' "$(pinned_id "$net")"
       wg show "$dev" | sed 's/^/  /'
     fi
   done
   [ "$any" = true ] || note "(no tunnel is up)"
+  auto_fix_dns
+}
+
+# Leftover DNS from a tunnel that died uncleanly breaks every name lookup, and
+# the user rarely connects that to the VPN. So any command that runs as root
+# repairs it on the way past; without root, say what is wrong instead.
+auto_fix_dns() {
+  [ "$OS_NAME" = "Darwin" ] || return 0
+  if [ "$(id -u)" -eq 0 ]; then
+    local n; n="$(dns_repair)"
+    [ "$n" -eq 0 ] || note "dns: restored $n network service(s) that still pointed at a closed tunnel"
+  else
+    status_dns_leftovers
+  fi
+}
+
+status_dns_leftovers() {
+  [ "$OS_NAME" = "Darwin" ] || return 0
+  local dead svc n=0
+  dead="$(dead_dns_ips)"; [ -n "$dead" ] || return 0
+  while IFS= read -r svc; do
+    [ -n "$svc" ] || continue
+    uses_any "$(svc_dns "$svc")" "$dead" && n=$((n + 1))
+  done <<EOF
+$(services)
+EOF
+  [ "$n" -eq 0 ] || note "warning: $n network service(s) still use DNS from a closed tunnel - run: sudo $0 status (repairs it)"
 }
 
 cmd_conf() {
@@ -560,6 +926,10 @@ cmd_remove() {
   resolve_client "$net"
   api DELETE "/api/extclients/$net/$RESOLVED_ID" >/dev/null
   rm -f "$WG_DIR/$(iface_for "$net").conf"
+  if [ -r "$CLIENTS_FILE" ]; then
+    awk -v n="$net" '$1!=n' "$CLIENTS_FILE" > "$CLIENTS_FILE.tmp" || true
+    mv "$CLIENTS_FILE.tmp" "$CLIENTS_FILE"
+  fi
   note "removed client '$RESOLVED_ID' from $net"
 }
 
@@ -568,7 +938,7 @@ usage() {
   if [ -n "${NMRAC_CLIENT_ID:-}" ]; then
     idline="$NMRAC_CLIENT_ID (NMRAC_CLIENT_ID, used on every network)"
   else
-    idline="$CLIENT_BASE-<network hash> (one per network)"
+    idline="pinned per network in $CLIENTS_FILE; new ones are $CLIENT_BASE-<network hash>"
   fi
   cat <<EOF
 nmrac - Netmaker Remote Access Client (CLI)
@@ -577,14 +947,18 @@ nmrac - Netmaker Remote Access Client (CLI)
   $0 login [--paste]                     SSO login (browser), or paste a JWT
   $0 logout                              forget the token
   $0 list                                networks, gateways, on/off state
-  $0 connect [--dns|--no-dns] [network]  bring a tunnel up (prompts if omitted)
-  $0 disconnect [network]                take it down (all if omitted)
-  $0 status                              wg peer state
+  $0 connect [--dns|--no-dns] [--id <clientid>] [network]
+                                         bring a tunnel up (prompts if omitted);
+                                         --id adopts an existing client, once
+  $0 disconnect [network]                take it down (all if omitted), restore DNS
+  $0 status                              wg peer state (repairs leftover DNS too)
+  $0 fix-dns                             only repair DNS a dead tunnel left (macOS)
   $0 conf <network>                      print the config the server hands out
   $0 remove <network>                    delete this machine's client
 
 Platform:  $OS_NAME
 Server:    ${API:-<unset - run: $0 server https://netmaker.example.com>}
+Device id: $DEVICE_ID
 Client id: $idline
 EOF
 }
@@ -597,6 +971,7 @@ case "${1:-}" in
   connect|up) shift; cmd_connect "$@" ;;
   disconnect|down) shift; cmd_disconnect "$@" ;;
   status) shift; cmd_status "$@" ;;
+  fix-dns|repair) shift; cmd_fix_dns "$@" ;;
   conf|config) shift; cmd_conf "$@" ;;
   remove) shift; cmd_remove "$@" ;;
   ""|-h|--help|help) usage ;;

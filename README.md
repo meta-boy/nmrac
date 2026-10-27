@@ -85,33 +85,50 @@ sudo nmrac disconnect
 | `nmrac login [--paste]` | SSO login via browser. `--paste` falls back to pasting a JWT by hand. |
 | `nmrac logout` | Forget the stored token. Leaves tunnels running. |
 | `nmrac list` | Networks, their gateways, and whether each tunnel is up. |
-| `nmrac connect [--dns\|--no-dns] [network]` | Bring a tunnel up. Prompts if no network is given. |
-| `nmrac disconnect [network]` | Take a tunnel down, or all of them. |
+| `nmrac connect [--dns\|--no-dns] [--id <clientid>] [network]` | Bring a tunnel up. Prompts if no network is given. `--id` adopts a specific existing client. |
+| `nmrac disconnect [network]` | Take a tunnel down, or all of them, and restore DNS (macOS). |
 | `nmrac status` | WireGuard peer state for active tunnels. |
+| `nmrac fix-dns` | macOS: restore DNS that a tunnel which died uncleanly left behind. `connect`, `disconnect`, `list` and `status` already do this when run as root. |
 | `nmrac conf <network>` | Print the config the server hands out, without applying it. |
 | `nmrac remove <network>` | Delete this machine's client from a network, server-side. |
 
-`connect` is idempotent. Each machine gets its own external client on each network, keyed on a stable client id, so reconnecting reuses the same client and IP rather than allocating a new one on every call. It will not touch a client belonging to another device.
+`connect` is idempotent. Each machine gets its own external client on each network, so reconnecting reuses the same client and IP rather than allocating a new one on every call. It will not touch a client belonging to another device.
 
-That id is `<machine>-<6 hex of the network name>` — **one per network, not one per machine**. Netmaker requires ext-client ids to be unique across the *whole server* rather than within a network: `isValid` in `controllers/ext_client.go` checks every new id against `logic.GetAllExtClients()`. A single id per machine can therefore only ever join one network, and the second `connect` fails with `400 client validation: duplicate client name`.
+### Which client a machine uses
 
-`NMRAC_CLIENT_ID` still pins an exact name, but it is then used on every network, so the same one-network limit applies to it. Clients created by older versions of `nmrac` are named `<machine>-cli`; one that is still present on a network keeps being used, so upgrading neither strands it nor creates a duplicate beside it.
+The first of these that exists on the network wins:
+
+1. **`--id <clientid>`**, or `NMRAC_CLIENT_ID` for every network. Use it once to adopt a client made some other way; it is then pinned.
+2. **The pinned id**: `/etc/nmrac/clients` records the client each network last connected with.
+3. **The client the server reports for this device.** New clients carry a stable device id (`nmrac-<hardware UUID>` on macOS, `nmrac-<machine-id>` on Linux) as both `device_id` and `remote_access_client_id`. The gateway listing hands that client back (`getUserRemoteAccessGwsV1`), and the server refuses a second client with the same device id on a gateway.
+4. **Hostname-derived ids from older versions**: `<machine>-<network hash>`, then `<machine>-cli`. Each is tried both as-is and without a trailing `-2`, `-3`.
+
+If none exists, a new client `<machine>-<6 hex of the network name>` is created and pinned.
+
+Pinning exists because the hostname is not stable. macOS renames `LocalHostName` to `Name-2` when another device on the LAN claims the same Bonjour name. Older versions derived the id from the hostname alone, so after a rename they no longer found their own client and tried to create another. The server then refused it, seemingly at random.
+
+New ids are **one per network, not one per machine**. Netmaker requires ext-client ids to be unique across the *whole server*, not just within a network: `isValid` in `controllers/ext_client.go` checks every new id against `logic.GetAllExtClients()`. So a single id per machine could only ever join one network. If creating a client is still refused, `nmrac` handles both errors:
+- **`duplicate client name`**: it reuses the client if it is ours on this network, and otherwise picks a fresh name.
+- **`remote client config already exists on the gateway`**: it asks the server which client that is and uses it.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `NMRAC_API` | from `/etc/nmrac/server` | Server URL; overrides the saved one |
-| `NMRAC_CLIENT_ID` | `$(hostname)-<network hash>` | Exact client id to use. Applies to every network |
-| `NMRAC_STATE_DIR` | `/etc/nmrac` | Token, server URL, interface map |
+| `NMRAC_CLIENT_ID` | pinned, else see above | Exact client id to use on every network. Prefer `connect --id`, which applies to one network |
+| `NMRAC_DEVICE_ID` | `nmrac-<hardware UUID / machine-id>` | Device id sent to the server |
+| `NMRAC_STATE_DIR` | `/etc/nmrac` | Token, server URL, interface map, pins, DNS snapshots |
 | `NMRAC_WG_DIR` | `/etc/wireguard` | Where `.conf` files are written |
 
 State on disk:
 
-- `/etc/nmrac/server` — server URL (`0644`)
-- `/etc/nmrac/token` — your JWT (`0600`)
-- `/etc/nmrac/ifaces` — interface-to-network map
-- `/etc/wireguard/nm-*.conf` — generated configs (`0600`)
+- `/etc/nmrac/server`: server URL (`0644`)
+- `/etc/nmrac/token`: your JWT (`0600`)
+- `/etc/nmrac/ifaces`: interface-to-network map
+- `/etc/nmrac/clients`: network-to-client-id pins (`0600`)
+- `/etc/nmrac/dns/nm-*`: macOS only, each network service's DNS from before a tunnel came up (`0600`)
+- `/etc/wireguard/nm-*.conf`: generated configs (`0600`)
 
 ## How it works
 
@@ -148,6 +165,8 @@ Both arrive at the same `/api/oauth/register/{regKey}` URL, but a 64-character s
 - **Tokens expire.** When one does, any command says so; run `nmrac login` again. Existing tunnels keep working — WireGuard does not care about the API.
 - **No boot persistence.** The tunnel does not come back after a reboot. `wg-quick@nm-*.service` will bring up an existing config, but the token may have expired by then, so a truly durable setup needs a re-login.
 - **DNS is decided per platform.** The server always emits a `DNS =` line. macOS `wg-quick` applies it natively via `scutil`, so it is kept. Linux `wg-quick` shells out to `resolvconf`, which many minimal images lack, so the line is kept only when `resolvconf` is installed and stripped otherwise — the tunnel comes up either way and your existing resolver is left alone. Force it with `--dns` or `--no-dns`.
+- **macOS DNS is restored by nmrac, not just by wg-quick.** wg-quick writes the tunnel's resolver onto *every* network service, including ones that appear later such as another VPN. It keeps the old values only in the memory of the route monitor it backgrounds. If that monitor dies first, nothing puts them back: every service keeps a resolver that only works through the tunnel, and all name lookups fail. The monitor can die through sleep, a reboot with the tunnel up, a killed shell, or `/var/run/wireguard` being cleared. So `connect` snapshots every service first. `disconnect` waits for wg-quick's own restore, then fixes any service still pointing at a closed tunnel and flushes the DNS cache. It uses the snapshot, or automatic DNS for services the snapshot doesn't name. The same repair runs automatically at the start of `connect`, `list` and `status` whenever they run as root, so a tunnel that died in its sleep is cleaned up the next time you use `nmrac` at all. `fix-dns` does only the repair. Tunnels that are still up are never touched.
+- **Tailscale shares `100.64.0.0/10`.** Netmaker networks often live in the same CGNAT range Tailscale uses. The tunnel's routes are more specific, so they win, but a Tailscale **exit node** sends DNS and other traffic its own way. `connect` warns when an exit node is active; turn it off while connected.
 - **Interface names.** Linux caps them at 15 characters and Netmaker network names are often longer, so configs are named `nm-<first 12 chars>`, falling back to `nm-<hash>` if two networks collide. `/etc/nmrac/ifaces` keeps the mapping, and `list`/`status` show real network names. On macOS the kernel assigns `utunN` regardless, so `status` shows both (`nm-lab-networ -> utun4`).
 - **Split vs full tunnel** is the gateway's decision, not this tool's. `nmrac` installs exactly the `AllowedIPs` the server sends.
 
@@ -185,7 +204,11 @@ If you run a different version and something breaks, an issue with your server v
 
 **`access denied` on an extclient path** — on v1.5.1 a client that does not exist answers `403 access denied` rather than `404`. `nmrac` treats any non-200 on the existence probe as "not present" and creates the client, so you should not see this; if you do, it is a genuine permission problem on the gateway.
 
-**`400 client validation: duplicate client name`** — ext-client ids are unique across the whole server, not per network, so the id is already taken on another network. `nmrac` scopes ids per network and should not hit this; if you set `NMRAC_CLIENT_ID`, that one name is used everywhere, so either vary it per network or `nmrac remove` the client holding it.
+**`400 client validation: duplicate client name`** — ext-client ids are unique across the whole server, not per network, so the id is already taken. `nmrac` reuses the client if it is yours on this network, and otherwise picks a fresh name. The error only reaches you for an explicit `--id` / `NMRAC_CLIENT_ID`: choose another name, or `nmrac remove` the client holding it.
+
+**`remote client config already exists on the gateway`** — this device already has a client on that gateway, and `nmrac` adopts it. If the server will not say which one, run `nmrac connect --id <clientid> <network>` once. The id is shown on the dashboard. After that it is pinned.
+
+**Name lookups fail after disconnecting** (macOS) — a tunnel's DNS was left on your network services. Any `sudo nmrac` command (`status` is the cheapest) repairs it, as does `sudo nmrac fix-dns`.
 
 **Tunnel up but nothing reachable** — check `nmrac status` for a recent handshake and non-zero transfer. If those look healthy, the crypto path is fine and you are looking at ACLs or filtering. Note that many gateways drop ICMP, so a failed `ping` proves nothing; try a real port.
 
